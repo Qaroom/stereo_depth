@@ -8,19 +8,21 @@ ROS2 Jazzy node that:
         /camera1/image_raw          (sensor_msgs/Image)   - right
         /camera0/camera_info        (sensor_msgs/CameraInfo)
         /camera1/camera_info        (sensor_msgs/CameraInfo)
-  * Runs SIFT + RANSAC once on the first usable frame to obtain
-    uncalibrated rectification homographies (H1, H2).
-  * For every subsequent frame:
+  * Prepares stereo rectification according to `rectification_mode`.
+  * For every synchronised frame:
         - Rectifies both images.
-        - Computes a StereoSGBM disparity map.
-        - Converts to depth: depth_mm = baseline_mm * f_px / disparity_px
+        - Computes a StereoSGBM disparity map (optionally median-filtered).
+        - Converts disparity to distance (in mm) according to
+          `distance_mode`:
+              "z"      -> perpendicular depth (classical Z)
+              "radial" -> Euclidean distance from camera centre to 3D point
   * Opens an OpenCV window.  The user can:
         - Left-click + drag  -> rectangular ROI
         - Right-click + drag -> circular ROI
-    The median depth of the valid pixels inside the ROI is drawn on the
-    image (in millimetres and metres).
+    The median distance of the valid pixels inside the ROI is drawn on
+    the image (in millimetres and metres).
   * Keys:
-        k -> redo SIFT/RANSAC calibration on the next frame
+        k -> reset rectification (recompute on next frame, uncalibrated mode)
         c -> clear the current selection
         q -> quit
 """
@@ -59,6 +61,9 @@ class StereoDepthNode(Node):
         self.declare_parameter("sgbm_block_size", 5)
         self.declare_parameter("show_disparity_window", True)
         self.declare_parameter("rectification_mode", "none")
+        # NEW:
+        self.declare_parameter("distance_mode", "radial")        # "radial" | "z"
+        self.declare_parameter("disparity_median_size", 5)        # 0/1 disables, otherwise odd
 
         baseline_mm = self.get_parameter("baseline_mm").value
         left_img = self.get_parameter("left_image_topic").value
@@ -70,6 +75,8 @@ class StereoDepthNode(Node):
         block_size = int(self.get_parameter("sgbm_block_size").value)
         self.show_disp = bool(self.get_parameter("show_disparity_window").value)
         rect_mode = str(self.get_parameter("rectification_mode").value).lower()
+        dist_mode = str(self.get_parameter("distance_mode").value).lower()
+        med_size = int(self.get_parameter("disparity_median_size").value)
 
         # -------- Stereo pipeline --------
         self.processor = StereoProcessor(
@@ -77,19 +84,24 @@ class StereoDepthNode(Node):
             sgbm_num_disparities=num_disp,
             sgbm_block_size=block_size,
             rectification_mode=rect_mode,
+            distance_mode=dist_mode,
+            median_filter_size=med_size,
         )
         self.bridge = CvBridge()
+        # Pretty label for the on-screen text.
+        self._distance_label = ("Mesafe (radial)" if dist_mode == "radial"
+                                else "Mesafe (Z)")
 
         # -------- Camera info bookkeeping --------
-        self._info_left = None   # dict with K, D, R, P, size
+        self._info_left = None
         self._info_right = None
 
         # -------- Mouse / selection state --------
         self.drawing = False
-        self.shape_mode = None  # "rect" or "circle"
+        self.shape_mode = None
         self.start_pt = None
         self.end_pt = None
-        self.locked_shape = None  # last completed selection dict
+        self.locked_shape = None
 
         # -------- Subscribers --------
         qos = QoSProfile(
@@ -117,8 +129,6 @@ class StereoDepthNode(Node):
         if self.show_disp:
             cv2.namedWindow(WINDOW_DISP, cv2.WINDOW_NORMAL)
 
-        # -------- Periodic GUI tick (so the window stays alive even
-        #          before the first synced pair arrives)
         self.create_timer(0.03, self._gui_tick)
 
         self.get_logger().info(
@@ -129,6 +139,8 @@ class StereoDepthNode(Node):
             f"  right info : {right_info}\n"
             f"  baseline   : {baseline_mm} mm\n"
             f"  rectif. mode: {rect_mode}\n"
+            f"  distance mode: {dist_mode}\n"
+            f"  disparity median size: {self.processor.median_filter_size}\n"
             f"Controls:  L-drag = rectangle  |  R-drag = circle  |  "
             f"k = recalibrate  |  c = clear  |  q = quit"
         )
@@ -152,7 +164,7 @@ class StereoDepthNode(Node):
             self._info_left = info
             self._try_push_intrinsics()
         else:
-            self._info_left = info  # silently refresh
+            self._info_left = info
 
     def right_info_cb(self, msg: CameraInfo):
         info = self._info_to_dict(msg)
@@ -237,9 +249,6 @@ class StereoDepthNode(Node):
             self.get_logger().error(f"cv_bridge conversion failed: {e}")
             return
 
-        # Rectification setup. For mode "none" this is a no-op; for
-        # "calibrated" it builds maps from CameraInfo; for "uncalibrated"
-        # it runs SIFT + RANSAC on the first usable frame.
         if not self.processor.calibrated:
             self.get_logger().info(
                 f"Preparing rectification (mode={self.processor.mode})..."
@@ -273,7 +282,6 @@ class StereoDepthNode(Node):
         if shape_to_show is not None:
             self._draw_selection_and_distance(display, depth_mm, shape_to_show)
 
-        # Help text along the bottom
         h, w = display.shape[:2]
         cv2.putText(
             display,
@@ -319,7 +327,7 @@ class StereoDepthNode(Node):
             cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)
             cv2.rectangle(display, (x0, y0), (x1, y1), (0, 255, 0), 2)
             text_pos = (x0, max(20, y0 - 10))
-        else:  # circle
+        else:
             cx, cy = sx, sy
             r = int(np.hypot(ex - sx, ey - sy))
             if r < 2:
@@ -330,12 +338,13 @@ class StereoDepthNode(Node):
             text_pos = (max(0, cx - r), max(20, cy - r - 10))
 
         med = StereoProcessor.region_median_depth(depth_map, mask)
-        if med is None or med <= 0 or not np.isfinite(med):
-            label = "Mesafe: gecersiz (valid disparity yok)"
-        else:
-            label = f"Mesafe: {med:.0f} mm  ({med / 1000.0:.3f} m)"
 
-        # Background box for readability
+        if med is None or med <= 0 or not np.isfinite(med):
+            label = f"{self._distance_label}: gecersiz (valid disparity yok)"
+        else:
+            label = f"{self._distance_label}: {med:.0f} mm  ({med / 1000.0:.3f} m)"
+            self.get_logger().info(f"the distance of object is : {med:.1f} mm")
+
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
         tx, ty = text_pos
         cv2.rectangle(display,
@@ -346,7 +355,6 @@ class StereoDepthNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
 
     def _gui_tick(self):
-        """Pump OpenCV's event loop and handle key presses."""
         key = cv2.waitKey(1) & 0xFF
         if key == 255:
             return

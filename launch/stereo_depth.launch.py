@@ -50,7 +50,7 @@ def generate_launch_description():
     )
     num_disp_arg = DeclareLaunchArgument(
         "sgbm_num_disparities",
-        default_value="128",
+        default_value="64",
         description="StereoSGBM numDisparities (must be a multiple of 16).",
     )
     block_size_arg = DeclareLaunchArgument(
